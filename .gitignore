@@ -1,0 +1,53 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+
+# ROS / CMake build outputs
+build/
+devel/
+install/
+log/
+logs/
+.catkin_tools/
+.ros/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+
+# Experiment outputs and trained model weights
+runs/
+wandb/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+events.out.tfevents.*
+*.bag
+*.bag.active
+
+# Local credentials and machine-specific settings
+.env
+.env.*
+!.env.example
+!.env.*.example
+.idea/
+.vscode/
+
+# Editor, notebook, and OS temporary files
+.ipynb_checkpoints/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.log
