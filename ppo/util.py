@@ -161,13 +161,19 @@ def _static_models(container, parent_pose, directory, parent_static=False):
 
 
 class GridMap:
-    resolution = 0.5
+    resolution = 0.25
+    inflation_radius = 0.15
     world_half = 2.5
 
     def __init__(self, world_file):
-        self.centers = np.arange(-self.world_half, self.world_half + 0.25, self.resolution)
+        self.centers = np.linspace(
+            -self.world_half, self.world_half,
+            int(round(2.0 * self.world_half / self.resolution)) + 1,
+        )
         x, y = np.meshgrid(self.centers, self.centers)
         self.occupied = np.zeros(x.shape, dtype=np.bool_)
+        half_cell = self.resolution / 2.0
+        corners = np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]])
         world_file = Path(world_file).resolve()
         world = ET.parse(world_file).getroot().find("world")
         if world is None:
@@ -181,7 +187,6 @@ class GridMap:
                     dx, dy = x - px, y - py
                     geometry = collision.find("geometry")
                     box, cylinder = geometry.find("box"), geometry.find("cylinder")
-                    half_cell = self.resolution / 2.0
                     if box is not None:
                         half_x, half_y, _ = np.fromstring(box.findtext("size"), sep=" ") / 2.0
                         # Separating-axis test: cell axes and rotated rectangle axes.
@@ -191,12 +196,28 @@ class GridMap:
                             & (np.abs(c * dx + s * dy) <= half_x + half_cell * (abs(c) + abs(s)))
                             & (np.abs(-s * dx + c * dy) <= half_y + half_cell * (abs(c) + abs(s)))
                         )
+                        # Disjoint rectangles attain their minimum distance at
+                        # a vertex and the other rectangle. Inflation is round.
+                        qx = dx[..., None] + half_cell * corners[:, 0]
+                        qy = dy[..., None] + half_cell * corners[:, 1]
+                        cell_distance_sq = (
+                            np.maximum(np.abs(c * qx + s * qy) - half_x, 0.0) ** 2
+                            + np.maximum(np.abs(-s * qx + c * qy) - half_y, 0.0) ** 2
+                        ).min(axis=-1)
+                        vx = c * half_x * corners[:, 0] - s * half_y * corners[:, 1]
+                        vy = s * half_x * corners[:, 0] + c * half_y * corners[:, 1]
+                        box_distance_sq = (
+                            np.maximum(np.abs(dx[..., None] - vx) - half_cell, 0.0) ** 2
+                            + np.maximum(np.abs(dy[..., None] - vy) - half_cell, 0.0) ** 2
+                        ).min(axis=-1)
+                        # Include touching boundaries despite floating-point roundoff.
+                        overlap |= np.minimum(cell_distance_sq, box_distance_sq) <= self.inflation_radius ** 2 + 1e-12
                     elif cylinder is not None:
-                        radius = float(cylinder.findtext("radius"))
+                        radius = float(cylinder.findtext("radius")) + self.inflation_radius
                         overlap = (
                             np.maximum(np.abs(dx) - half_cell, 0.0) ** 2
                             + np.maximum(np.abs(dy) - half_cell, 0.0) ** 2
-                        ) <= radius ** 2
+                        ) <= radius ** 2 + 1e-12
                     else:
                         raise ValueError("World map supports box and cylinder collision geometry only")
                     self.occupied |= overlap
@@ -213,7 +234,7 @@ class GridMap:
                     visited.add(neighbor)
                     pending.append(neighbor)
         if len(visited) != len(self.free_cells):
-            raise ValueError("The 0.5 m grid contains disconnected free regions")
+            raise ValueError("The rasterized grid contains disconnected free regions")
         self.task_points = np.array([[2, 2], [2, -2], [-2, 2], [-2, -2]], dtype=np.float64)
         for start in self.task_points:
             cell = self.nearest_free_cell(start)
