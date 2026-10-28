@@ -11,6 +11,8 @@
 使用 ROS1 Noetic、Gazebo、Python 3.8、NumPy、PyTorch、TensorBoard 和 rospkg。
 ROS 消息/服务来自 `rospy`、`sensor_msgs`、`nav_msgs`、`geometry_msgs`、`gazebo_msgs`、`std_srvs`。
 不需要 Gymnasium、SLAM、map_server 或额外的 A* 库。
+可选 A* 窗口使用 Matplotlib 的 TkAgg 后端，需要 Matplotlib、Python Tkinter/Tk 和图形桌面；
+本机环境已安装。默认关闭时不导入 Matplotlib，也不要求图形桌面。
 本机已验证可导入这些依赖的解释器为：
 
 ```bash
@@ -40,14 +42,33 @@ CUDA 不可用时直接报错，不自动切回 CPU；需要使用 CPU 时显式
 不要同时运行其他向 `/cmd_vel` 发布消息的控制程序。
 修改代码后先停止旧训练进程，再启动新进程，当前进程不会自动加载修改。
 
-默认总计训练 **100000 个环境交互 step**，每 **5000 step** 保存一次模型。
+需要逐步检查 A* 路径和奖励时开启窗口：
+
+```bash
+python main.py --a_star on
+python main.py --mode eval --checkpoint runs/train_<时间>/last.pt --a_star on
+```
+
+`--a_star` 只接受 `on`、`off`，默认 `off`。训练、周期评估和手动评估共用一个窗口，
+显示膨胀后的占用栅格、本次实际搜索扩展过的格子、最短路径、机器人实际位置和目标。
+窗口方向为向上是 x 正方向、向左是 y 正方向；地图、路径和位置标记采用相同显示方向。
+数值面板逐步显示回合内 step、上一步及当前 A* 距离（m）、`r_arrival`、`r_step`、`r_dist`、
+`r_collision` 和总 `reward`；距离与奖励显示 6 位小数，奖励带正负号。
+数值来自本步环境的实际计算，不在窗口中重算奖励。reset 时显示新距离，上一步距离和奖励显示为“—”。
+窗口每个 reset/step 刷新，不逐节点播放或人为等待；PPO 更新期间保留最后一帧。
+关闭窗口只停止显示，训练/评估继续且不自动重开；退出时清理窗口，图形初始化失败直接报错。
+窗口里的路径是 A* 距离奖励的参考路径，机器人动作仍由 PPO 决定。
+关闭功能时不记录搜索过程；逐步数值仅显示在窗口，终端仍只输出完整评估汇总。
+
+默认总计训练 **100000 个训练交互 step**，每 **10000 step** 先保存模型，再确定性评估 **20 回合**。
+评估交互不计入训练步数。`--save-interval` 同时控制保存和评估间隔，`--eval-episodes` 控制每次评估回合数。
 短训练联调可以缩小步数预算、保存间隔、rollout 和更新轮数：
 
 ```bash
-python main.py --mode train --max-train-steps 64 --save-interval 32 --timeout-steps 32 --horizon 32 --epochs 2 --batch-size 16
+python main.py --mode train --max-train-steps 64 --save-interval 32 --eval-episodes 2 --timeout-steps 32 --horizon 32 --epochs 2 --batch-size 16
 ```
 
-评估和继续训练分别运行，替换下面的 checkpoint 路径：
+也可手动评估或继续训练，替换下面的 checkpoint 路径：
 
 ```bash
 python main.py --mode eval --checkpoint runs/train_<时间>/last.pt --eval-episodes 20
@@ -60,7 +81,7 @@ python main.py --mode train --checkpoint runs/train_<时间>/last.pt --max-train
 相同；如原训练改变了这些参数，加载时也传相同值。训练恢复优化器，但使用本次命令的学习率，
 从新回合开始，不恢复未更新的 buffer 或 Gazebo 中间状态，同时恢复最近 100 个完整回合的结果。
 旧 checkpoint 没有窗口历史时，从新回合开始累计窗口。评估只读取网络，不更新参数。
-随机种子按 `seed + episode - 1` 设置；这不保证异步 Gazebo 运行完全确定。
+训练重置种子按 `seed + episode - 1` 设置；这不保证异步 Gazebo 运行完全确定。
 
 完整 checkpoint 也可直接作为策略使用。`obs` 必须是下文定义的、已经处理过的 364 维观测：
 
@@ -68,7 +89,7 @@ python main.py --mode train --checkpoint runs/train_<时间>/last.pt --max-train
 import torch
 from ppo_agent import PPOAgent
 
-path = "runs/train_<时间>/step_005000.pt"
+path = "runs/train_<时间>/step_010000.pt"
 saved = torch.load(path, map_location="cuda", weights_only=False)
 agent = PPOAgent(dict(saved["config"], device="cuda"))
 agent.load(path)
@@ -122,7 +143,7 @@ reset 使用 `/gazebo/reset_world` 重置场景而不将仿真时钟归零，设
 ## 地图与奖励
 
 默认通过 `rospkg` 查找 `turtlebot3_gazebo/worlds/turtlebot3_stage_4.world`。
-每次启动都会打印实际使用的 world 绝对路径。可通过 `--world-file` 指定绝对或相对路径，
+可通过 `--world-file` 指定绝对或相对路径，
 例如切换到 APSR：
 
 ```bash
@@ -144,24 +165,24 @@ sun/ground_plane 不作为障碍，非静态模型不写入固定 A* 底图。
 相对命名坐标在初始化时明确报错。
 更换 world 文件时，应自行让 Gazebo 加载同一场景；该参数不会重启或改变 Gazebo。
 
-先将原始碰撞几何按欧氏距离向外膨胀 **0.15 m**，再用 **0.25 m** 方格栅格化。
+先将原始碰撞几何按欧氏距离向外膨胀 **0.15 m**，再用 **0.2 m** 方格栅格化。
 0.15 m 是总膨胀距离，不再叠加机器人半径或其他裕量。矩形膨胀包含圆角，圆柱半径增加 0.15 m；
 格子与膨胀区域相交或接触即占用，不通过给占用格增加一整圈来膨胀。
-格心为 `-2.5,-2.25,...,2.5`，共 `21×21` 格；默认 stage 4 占用 273 格、空闲 168 格。
-A* 用八邻接，直行 0.25 m、对角 `0.25√2` m，
+格心以原点对齐，为 `-2.4,-2.2,...,2.4`，共 `25×25` 格；格子边界覆盖 `[-2.5,2.5]`。
+默认 stage 4 占用 339 格、空闲 286 格；四角 `(±2,±2)` 都在格心上。
+A* 用八邻接，直行 0.2 m、对角 `0.2√2` m，
 禁止对角穿墙。启动时验证所有空闲格连通、四个任务角点为空闲且所有起终点组合可达。
-当前仓库的 APSR 场景在这组参数下会产生两个孤立空闲格，触发连通性检查，不能直接启动；
-默认 stage 4 已验证通过。
+默认 stage 4 和当前仓库的 APSR 场景均已通过连通性及全部 12 组角点任务的路径检查。
 位置映射到最近格心；占用位置投影到最近空闲格，等距时按行列顺序选择。
 `d_A*` 只包含格心之间的最短路，不包含位置到格心的连接距离；同格移动奖励为零。
 地图仅用于奖励，不把 A* 路径作为策略观测或控制指令。
 地图膨胀与雷达的 0.15 m 碰撞判定阈值独立。旧 checkpoint 可直接加载；继续训练时采用新地图的
 A* 距离奖励，不改写已有模型和历史统计，因此新旧地图下的回报不宜直接比较。
 起终点仍从四个 `(±2,±2)` 角点随机选择两个不同点，目标不固定为对角，允许与上一回合重复。
-每次 reset 后，终端打印 `reset episode=... start=(x, y) goal=(x, y)`，可直接核对本回合位置。
-成功、碰撞或超时后，先保存终止步数据、更新回合计数和窗口统计，再 reset 下一回合，
-之后才执行可能的 PPO 更新和模型保存。下一回合每次只 reset 一次；达到总训练步数或
-评估回合上限后，不再创建下一回合。buffer 中保留的是 reset 前的终止观测及结束标记。
+成功、碰撞或超时后，先保存终止步数据、更新回合计数和窗口统计。普通回合结束时先 reset
+下一训练回合，再执行可能的 PPO 更新；保存节点则先执行到期更新、保存、评估，之后才 reset
+下一训练回合。达到总训练步数后只完成最终评估，不再创建训练回合。
+buffer 中保留的是 reset 前的真实下一观测及结束标记。
 
 目标模型固定名为 `ppo_goal`。启动时只清理该模型及历史 `tb3_ppo_*_goal` 标记，
 不清理其他场景模型。每次 reset 都先删除上一回合的目标，再直接在选定目标坐标重新生成
@@ -184,6 +205,8 @@ reward      = r_arrival + r_step + r_dist + r_collision
 碰撞步为 `-101 + r_dist`。默认 800 步超时，不额外处罚超时。
 reset 初始化上一步路径距离，不为 reset 本身计算奖励。
 `info` 提供位姿、目标、欧氏距离、方向、最小雷达距离、A* 距离，以及 step 的各奖励项和结束原因。
+每步还提供 `step`、`previous_astar_distance` 和 `reward`，分别为回合内步数、实际用于距离奖励的
+上一步 A* 距离及本步总奖励。reset 的 `step` 为 0，不生成尚未产生的奖励项。
 
 ## PPO 与输出
 
@@ -196,31 +219,34 @@ reset 初始化上一步路径距离，不为 reset 本身计算奖励。
 | `--horizon` / `--batch-size` / `--epochs` | 2048 / 64 / 10 |
 | `--actor-lr` / `--critic-lr` | 0.0003 / 0.0003 |
 | `--max-grad-norm` | 0.5，Actor/Critic 分别裁剪 |
-| `--max-train-steps` / `--eval-episodes` | 100000 环境 step / 20 回合 |
-| `--save-interval` | 每 5000 环境 step |
+| `--max-train-steps` / `--eval-episodes` | 100000 训练 step / 每次评估 20 回合 |
+| `--save-interval` | 每 10000 训练 step 保存并评估 |
 
 使用优势标准化和价值 MSE，不添加熵奖励、学习率调度、奖励缩放。
 到达/碰撞不 bootstrap；超时用 reset 前观测 bootstrap，同时切断跨回合 GAE；
-rollout 截断和总步数预算截断也使用下一状态价值。正常完成训练时更新剩余样本，
-随后保存最终步数的 checkpoint 和 `last.pt`。
+rollout 截断、评估节点截断和总步数预算截断也使用下一状态价值。评估节点截断切断跨回合 GAE，
+但不清空未满的 buffer；评估结束后继续收集训练样本。正常完成训练时更新剩余样本，
+随后保存最终步数的 checkpoint 和 `last.pt`，并评估一次。周期节点与最终节点重合时不重复执行。
 
 达到总步数上限时，如果最后一回合还未到达、碰撞或环境超时，则不记录这个未完成回合的
 reward，也不将它当作超时放进统计窗口；它已采集的样本仍参与最终更新。
+每个保存节点严格按训练 step 触发，不等待当前回合结束；被评估节点中断的未完成回合同样
+不增加已完成 episode 数、不记录回合 reward，也不进入统计窗口。评估后从新训练回合开始。
 
 每次训练创建独立的 `runs/train_<UTC时间>/`。
 `runs` 相对于启动命令所在目录；按上面的命令启动时，输出位于 `ppo/runs/`：
 
-- `step_005000.pt`、`step_010000.pt` 等周期 checkpoint。
+- `step_010000.pt`、`step_020000.pt` 等周期 checkpoint。
 - 最终步数对应的 checkpoint（默认 `step_100000.pt`）和 `last.pt`，两者包含相同的最终模型。
 - TensorBoard event 文件；三种比例的子目录由 TensorBoard 自动创建。
-- `checkpoint_metrics.csv`：本次运行保存的各个 step 模型及对应训练窗口统计。
+- `checkpoint_metrics.csv`：本次运行保存的各个 step 模型及对应训练窗口、独立评估统计。
 
 checkpoint 包含 Actor、Critic、两个优化器、配置、已完成 episode 数、累计采样 step、
 更新次数和最近 100 个完整回合的结果。周期保存只保存当时最新模型，不额外触发 PPO 更新。
 如果保存点落在回合中间，已完成 episode 数和窗口都不包含该未完成回合；恢复后从新回合开始。
 
-训练不自动执行周期性 eval，也不会在保存模型时插入评估。保存成功后，将最近 100 个完整
-训练回合的结果写入 `checkpoint_metrics.csv`，字段如下：
+保存成功后先将最近 100 个完整训练回合的结果写入 `checkpoint_metrics.csv`，评估列留空、
+`eval_episodes` 为 0；完整评估结束后补填同一行，不改写已经保存的 checkpoint。字段如下：
 
 | 字段 | 含义 |
 |---|---|
@@ -229,13 +255,20 @@ checkpoint 包含 Actor、Critic、两个优化器、配置、已完成 episode 
 | `window_episodes` | 实际参与统计的回合数，最多 100 |
 | `success_rate_100` | 窗口成功率，范围 `0～1` |
 | `collision_rate_100` / `timeout_rate_100` | 同一窗口的碰撞率 / 超时率 |
+| `eval_episodes` | 完整评估的回合数，默认 20；未完成评估时为 0 |
+| `eval_success_rate` | 确定性评估成功率，范围 `0～1` |
+| `eval_collision_rate` / `eval_timeout_rate` | 同次评估的碰撞率 / 超时率 |
 
-每个 step 模型一行；CSV 按成功率降序排列，并列时按 step 降序，第一行即当前最高成功率模型。
-尚无完整回合的模型将三个比例留空、窗口数量写 0，排在表末尾。
+每个 step 模型一行；CSV 按评估成功率降序排列，并列时按训练 step 降序，未完成评估的行排在末尾。
+尚无完整训练回合时，三个训练窗口比例留空、窗口数量写 0，仍可正常评估和排序。
 `last.pt` 是最终 step 模型的同内容别名，不重复写一行。
-这些比例来自训练中的滑动窗口，不是额外评估得出的模型测试成绩。
 恢复训练时使用 checkpoint 中的窗口历史，新目录的表只记录本次恢复运行新保存的模型。
 不生成逐回合或逐更新的 CSV。
+
+评估复用同一个 Gazebo 环境，Actor 使用高斯均值经 tanh 和缩放生成动作，不进行随机动作采样，
+不更新网络或优化器。每次使用相同的重置种子 `seed + 1000000 + i`，其中 `i=0…eval_episodes-1`，
+便于比较不同 checkpoint；这不保证异步 Gazebo 仿真完全确定。评估数据不进入 buffer、训练计数或
+最近 100 回合窗口。评估中断时保留已经保存的模型和未完成评估的 CSV 行，并执行环境清理。
 
 ## TensorBoard
 
@@ -245,20 +278,29 @@ checkpoint 包含 Actor、Critic、两个优化器、配置、已完成 episode 
 tensorboard --logdir runs
 ```
 
-浏览器打开 `http://localhost:6006`。训练仅记录以下两张图，横轴都是**已完成的 episode 编号**：
+浏览器打开 `http://localhost:6006`。训练仅记录以下三张图：
 
-| 标签 | 内容 |
-|---|---|
-| `episode/reward` | 每个完整 episode 的总 reward |
-| `episode/outcome_rate_100` | 同图中的 `success`、`collision`、`timeout` 三条比例曲线 |
+| 标签 | 内容 | 横轴 |
+|---|---|---|
+| `episode/reward` | 每个完整训练 episode 的总 reward | 已完成训练 episode 编号 |
+| `episode/outcome_rate_100` | 训练窗口的 `success`、`collision`、`timeout` 三条比例曲线 | 已完成训练 episode 编号 |
+| `eval/outcome_rate` | 每次完整评估的 `success`、`collision`、`timeout` 三条比例曲线 | 累计训练 step |
 
-窗口包含刚完成的当前回合及此前最多 99 回合；不足 100 回合时按已有数量计算。
+训练窗口包含刚完成的当前回合及此前最多 99 回合；不足 100 回合时按已有数量计算。
 每完成一回合就记录一次，比例范围为 `0～1`，三者相加为 1。
 例如首回合碰撞，则该点的成功率、碰撞率、超时率为 `0、1、0`。
 第 101 回合起移除窗口中最早的一回合。恢复训练时延续 episode 编号与 checkpoint 中的窗口历史，
 并写入新的训练目录；不记录 loss、奖励分项等其他 TensorBoard 指标。
 
-评估只在终端输出回合 reward 和窗口比例，不创建输出目录、CSV、TensorBoard event 或模型文件。
+周期评估与手动 `--mode eval` 均只在完整评估结束后输出一行汇总，例如：
+
+```text
+eval episodes=20 success=75.0% collision=15.0% timeout=10.0%
+```
+
+不输出启动信息、逐回合日志、reset 坐标、保存提示或训练结束提示；未完成评估不输出汇总，
+错误仍正常上抛。CSV、TensorBoard 和训练统计照常记录。
+手动评估不创建输出目录、CSV、TensorBoard event 或模型文件。
 完整参数通过 `python main.py --help` 查看。
 
 配置在入口集中检查；传感器同步和 ROS 服务结果在环境边界检查。

@@ -161,15 +161,14 @@ def _static_models(container, parent_pose, directory, parent_static=False):
 
 
 class GridMap:
-    resolution = 0.25
+    resolution = 0.2
     inflation_radius = 0.15
     world_half = 2.5
 
     def __init__(self, world_file):
-        self.centers = np.linspace(
-            -self.world_half, self.world_half,
-            int(round(2.0 * self.world_half / self.resolution)) + 1,
-        )
+        count = int(math.floor(self.world_half / self.resolution))
+        self.centers = np.arange(-count, count + 1) * self.resolution
+        self.visualize = False
         x, y = np.meshgrid(self.centers, self.centers)
         self.occupied = np.zeros(x.shape, dtype=np.bool_)
         half_cell = self.resolution / 2.0
@@ -267,20 +266,108 @@ class GridMap:
         start, target = self.nearest_free_cell(position), self.nearest_free_cell(goal)
         best = {start: 0.0}
         queue = [(0.0, 0.0, start)]
+        if self.visualize:
+            parents, expanded = {}, []
         while queue:
             _, cost, cell = heapq.heappop(queue)
             if cost > best[cell]:
                 continue
+            if self.visualize:
+                expanded.append(cell)
             if cell == target:
+                if self.visualize:
+                    path = [target]
+                    while path[-1] != start:
+                        path.append(parents[path[-1]])
+                    self.last_path = self.centers[np.asarray(path[::-1])[:, ::-1]]
+                    self.last_expanded = np.asarray(expanded)
                 return cost
             for neighbor, edge_cost in self.neighbors(cell):
                 candidate = cost + edge_cost
                 if candidate < best.get(neighbor, math.inf):
                     best[neighbor] = candidate
+                    if self.visualize:
+                        parents[neighbor] = cell
                     dr, dc = abs(neighbor[0] - target[0]), abs(neighbor[1] - target[1])
                     heuristic = self.resolution * (max(dr, dc) + (math.sqrt(2.0) - 1.0) * min(dr, dc))
                     heapq.heappush(queue, (candidate + heuristic, candidate, neighbor))
         raise RuntimeError("No A* path on the validated static grid")
+
+
+class AStarViewer:
+    """Optional GUI for the same A* search and rewards used by the environment."""
+
+    def __init__(self, grid):
+        import matplotlib
+        matplotlib.use("TkAgg")
+        from matplotlib import pyplot as plt
+        from matplotlib.colors import ListedColormap
+        from matplotlib.patches import Patch
+
+        self.grid, self.plt, self.closed = grid, plt, False
+        plt.ion()
+        self.figure, axis = plt.subplots(figsize=(8.4, 6.2))
+        self.figure.canvas.manager.set_window_title("TurtleBot3 A*")
+        self.figure.subplots_adjust(left=0.08, right=0.67, bottom=0.16, top=0.88)
+        edges = np.r_[grid.centers - grid.resolution / 2.0, grid.centers[-1] + grid.resolution / 2.0]
+        extent = (edges[0], edges[-1], edges[0], edges[-1])
+        # Display world +x upward and +y leftward.
+        axis.imshow(grid.occupied.T, origin="lower", extent=extent,
+                    cmap=ListedColormap(["white", "#64748b"]), vmin=0, vmax=1)
+        self.expanded_image = axis.imshow(
+            np.ma.masked_all(grid.occupied.shape), origin="lower", extent=extent,
+            cmap=ListedColormap(["#93c5fd"]), vmin=0, vmax=1, alpha=0.7,
+        )
+        self.path_line, = axis.plot([], [], color="#e11d48", linewidth=2, label="A* path")
+        self.robot, = axis.plot([], [], "o", color="#16a34a", markersize=7, label="Robot")
+        self.goal, = axis.plot([], [], "*", color="#eab308", markeredgecolor="#854d0e",
+                               markersize=13, label="Goal")
+        axis.set(xlim=(grid.world_half, -grid.world_half), ylim=(-grid.world_half, grid.world_half),
+                 xlabel="y / m", ylabel="x / m", aspect="equal",
+                 title="A* | grid {:.2f} m | inflation {:.2f} m".format(grid.resolution, grid.inflation_radius))
+        axis.set_xticks(np.arange(-2, 3))
+        axis.set_yticks(np.arange(-2, 3))
+        axis.set_xticks(edges, minor=True)
+        axis.set_yticks(edges, minor=True)
+        axis.tick_params(which="minor", bottom=False, left=False)
+        axis.grid(which="minor", color="#cbd5e1", linewidth=0.5)
+        self.status_text = self.figure.text(0.71, 0.79, "Waiting for reset", va="top", family="monospace", fontsize=10)
+        self.figure.legend(handles=[Patch(facecolor="#64748b", label="Occupied (inflated)"),
+                                    Patch(facecolor="#93c5fd", label="Expanded"),
+                                    self.path_line, self.robot, self.goal],
+                           loc="lower center", bbox_to_anchor=(0.37, 0.01), ncol=3, fontsize=8)
+        self.figure.canvas.mpl_connect("close_event", self.close)
+        grid.viewer, grid.visualize = self, True
+        plt.show(block=False)
+        self.figure.canvas.draw()
+        self.figure.canvas.flush_events()
+
+    def update(self, info):
+        expanded = np.zeros(self.grid.occupied.shape, dtype=bool)
+        expanded[tuple(self.grid.last_expanded.T)] = True
+        self.expanded_image.set_data(np.ma.masked_where(~expanded, np.ones(expanded.shape)).T)
+        path = self.grid.last_path
+        self.path_line.set_data(path[:, 1], path[:, 0])
+        self.robot.set_data([info["y"]], [info["x"]])
+        self.goal.set_data([info["goal_y"]], [info["goal_x"]])
+        lines = ["step: {}".format(info["step"])]
+        if info["step"] == 0:
+            lines.append("d_A* prev: —")
+        else:
+            lines.append("d_A* prev: {:.6f} m".format(info["previous_astar_distance"]))
+        lines.extend(["d_A* now : {:.6f} m".format(info["astar_distance"]), ""])
+        for key in ("r_arrival", "r_step", "r_dist", "r_collision", "reward"):
+            lines.append("{}: —".format(key) if info["step"] == 0 else "{}: {:+.6f}".format(key, info[key]))
+        self.status_text.set_text("\n".join(lines))
+        self.figure.canvas.draw_idle()
+        self.figure.canvas.flush_events()
+
+    def close(self, event=None):
+        if self.closed:
+            return
+        self.closed = True
+        self.grid.visualize = False
+        self.plt.close(self.figure)
 
 
 def navigation_reward(previous_distance, distance, goal_distance, min_scan,
@@ -289,8 +376,8 @@ def navigation_reward(previous_distance, distance, goal_distance, min_scan,
     reached = goal_distance < goal_radius and not collision
     parts = {
         "r_arrival": 100.0 if reached else 0.0,
-        "r_step": -1.0,
-        "r_dist": previous_distance - distance,
+        "r_step": -0.1,
+        "r_dist": 5 * (previous_distance - distance),
         "r_collision": -100.0 if collision else 0.0,
     }
     return float(sum(parts.values())), reached, collision, parts

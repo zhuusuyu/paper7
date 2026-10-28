@@ -12,11 +12,21 @@ import numpy as np
 import torch
 
 from ppo_agent import PPOAgent
-from util import GridMap, RolloutBuffer
+from util import AStarViewer, GridMap, RolloutBuffer
+
+
+def write_checkpoint_metrics(run_dir, records):
+    records.sort(key=lambda row: (
+        row["eval_success_rate"] if row["eval_episodes"] else -1.0, row["total_steps"]
+    ), reverse=True)
+    with (run_dir / "checkpoint_metrics.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=records[0].keys())
+        writer.writeheader()
+        writer.writerows(records)
 
 
 def save_checkpoint(agent, run_dir, episode, total_steps, updates, recent_outcomes, records, final=False):
-    """Save weights first, then rank the checkpoints by their training-window score."""
+    """Save the model and its training statistics before evaluation starts."""
     path = run_dir / "step_{:06d}.pt".format(total_steps)
     agent.save(path, episode, total_steps, updates, recent_outcomes)
     if final:
@@ -28,14 +38,35 @@ def save_checkpoint(agent, run_dir, episode, total_steps, updates, recent_outcom
     }
     for outcome in ("success", "collision", "timeout"):
         record[outcome + "_rate_100"] = recent_outcomes.count(outcome) / count if count else None
+    record.update(eval_episodes=0, eval_success_rate=None, eval_collision_rate=None, eval_timeout_rate=None)
     records.append(record)
-    records.sort(key=lambda row: (
-        row["success_rate_100"] if row["window_episodes"] else -1.0, row["total_steps"]
-    ), reverse=True)
-    with (run_dir / "checkpoint_metrics.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=record.keys())
-        writer.writeheader()
-        writer.writerows(records)
+    write_checkpoint_metrics(run_dir, records)
+    return record
+
+
+def evaluate(agent, env, episodes, seed):
+    """Run fixed-seed deterministic episodes; an interrupted evaluation has no score."""
+    import rospy
+
+    outcomes = []
+    for index in range(episodes):
+        if rospy.is_shutdown():
+            break
+        state, _ = env.reset(seed=seed + 1000000 + index)
+        done = False
+        while not done and not rospy.is_shutdown():
+            action, _, _ = agent.select_action(state, deterministic=True)
+            state, _, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+        if done:
+            outcome = "success" if info["reached"] else "collision" if info["collision"] else "timeout"
+            outcomes.append(outcome)
+    if len(outcomes) != episodes:
+        return None
+    rates = {name: outcomes.count(name) / episodes for name in ("success", "collision", "timeout")}
+    print("eval episodes={} success={:.1%} collision={:.1%} timeout={:.1%}".format(
+        episodes, rates["success"], rates["collision"], rates["timeout"]), flush=True)
+    return rates
 
 
 def main():
@@ -43,12 +74,13 @@ def main():
     parser.add_argument("--mode", choices=("train", "eval"), default="train")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--world-file", type=Path)
+    parser.add_argument("--a_star", choices=("on", "off"), default="off", help="Show A* search, path and per-step rewards")
     parser.add_argument("--output-dir", type=Path, default=Path("runs"))
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--seed", type=int, default=3)
     parser.add_argument("--max-train-steps", type=int, default=100000, help="Total environment steps, including restored steps")
     parser.add_argument("--eval-episodes", type=int, default=20)
-    parser.add_argument("--save-interval", type=int, default=5000, help="Environment steps between checkpoints")
+    parser.add_argument("--save-interval", type=int, default=10000, help="Training steps between checkpoint saves and evaluations")
     parser.add_argument("--robot-model-name", default="turtlebot3_burger")
     parser.add_argument("--v-max", type=float, default=0.2)
     parser.add_argument("--w-max", type=float, default=1.5)
@@ -93,7 +125,6 @@ def main():
     if not args.world_file.is_file():
         parser.error("World file does not exist: {}".format(args.world_file))
     args.world_file = args.world_file.resolve()
-    print("world_file={}".format(args.world_file), flush=True)
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -118,74 +149,63 @@ def main():
         robot_model_name=args.robot_model_name,
     )
     try:
-        total_steps = counters["total_steps"] if training else 0
-        updates = counters["updates"] if training else 0
-        episode = counters["episode"] if training else 0
-        recent_outcomes = deque(counters["recent_outcomes"] if training else (), maxlen=100)
-        print("state_dim=364 action_dim=2 device={}".format(args.device), flush=True)
         with ExitStack() as resources:
-            if training:
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-                run_dir = args.output_dir / ("train_" + stamp)
-                run_dir.mkdir(parents=True)
-                writer = resources.enter_context(SummaryWriter(log_dir=str(run_dir), flush_secs=10))
-                buffer = RolloutBuffer(args.horizon, env.state_dim)
-                checkpoint_records = []
-                print("output={}".format(run_dir), flush=True)
-            state, reset_info = env.reset(seed=args.seed + episode)
-            print("reset episode={} start=({:.2f}, {:.2f}) goal=({:.2f}, {:.2f})".format(
-                episode + 1, reset_info["x"], reset_info["y"],
-                reset_info["goal_x"], reset_info["goal_y"]), flush=True)
-            while not rospy.is_shutdown() and (
-                total_steps < args.max_train_steps if training else episode < args.eval_episodes
-            ):
-                episode_reward, steps = 0.0, 0
+            if args.a_star == "on":
+                viewer = AStarViewer(grid)
+                resources.callback(viewer.close)
+            if not training:
+                evaluate(agent, env, args.eval_episodes, args.seed)
+                return
+            total_steps = counters["total_steps"]
+            updates = counters["updates"]
+            episode = counters["episode"]
+            recent_outcomes = deque(counters["recent_outcomes"], maxlen=100)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            run_dir = args.output_dir / ("train_" + stamp)
+            run_dir.mkdir(parents=True)
+            writer = resources.enter_context(SummaryWriter(log_dir=str(run_dir), flush_secs=10))
+            buffer = RolloutBuffer(args.horizon, env.state_dim)
+            checkpoint_records = []
+            state, _ = env.reset(seed=args.seed + episode)
+            while not rospy.is_shutdown() and total_steps < args.max_train_steps:
+                episode_reward = 0.0
                 done = False
-                while not done and not rospy.is_shutdown() and (not training or total_steps < args.max_train_steps):
-                    action, raw_action, log_prob = agent.select_action(state, deterministic=not training)
+                while not done and not rospy.is_shutdown() and total_steps < args.max_train_steps:
+                    action, raw_action, log_prob = agent.select_action(state)
                     next_state, reward, terminated, truncated, info = env.step(action)
-                    steps += 1
                     total_steps += 1
                     episode_reward += reward
-                    if training:
-                        buffer.add(state, raw_action, log_prob, reward, next_state, terminated, truncated)
+                    final_step = total_steps == args.max_train_steps
+                    checkpoint_due = total_steps % args.save_interval == 0 or final_step
+                    buffer.add(state, raw_action, log_prob, reward, next_state, terminated,
+                               truncated or (checkpoint_due and not terminated))
                     state = next_state
-                    done = terminated or truncated
-                    if done:
+                    done = terminated or truncated or checkpoint_due
+                    if terminated or truncated:
                         episode += 1
                         outcome = "success" if info["reached"] else "collision" if info["collision"] else "timeout"
                         recent_outcomes.append(outcome)
                         rates = {name: recent_outcomes.count(name) / len(recent_outcomes)
                                  for name in ("success", "collision", "timeout")}
-                        if training:
-                            writer.add_scalar("episode/reward", episode_reward, episode)
-                            writer.add_scalars("episode/outcome_rate_100", rates, episode)
-                        print("episode={} total_steps={} steps={} reward={:.3f} "
-                              "success_100={:.1%} collision_100={:.1%} timeout_100={:.1%}".format(
-                                  episode, total_steps, steps, episode_reward,
-                                  rates["success"], rates["collision"], rates["timeout"]), flush=True)
-                        if not rospy.is_shutdown() and (
-                            total_steps < args.max_train_steps if training else episode < args.eval_episodes
-                        ):
-                            state, reset_info = env.reset(seed=args.seed + episode)
-                            print("reset episode={} start=({:.2f}, {:.2f}) goal=({:.2f}, {:.2f})".format(
-                                episode + 1, reset_info["x"], reset_info["y"],
-                                reset_info["goal_x"], reset_info["goal_y"]), flush=True)
-                    if training and buffer.size == buffer.capacity:
+                        writer.add_scalar("episode/reward", episode_reward, episode)
+                        writer.add_scalars("episode/outcome_rate_100", rates, episode)
+                        if not rospy.is_shutdown() and not checkpoint_due:
+                            state, _ = env.reset(seed=args.seed + episode)
+                    if buffer.size == buffer.capacity or (final_step and buffer.size):
                         agent.update(buffer)
                         updates += 1
-                    # At the budget boundary, save only after the final partial update below.
-                    if training and total_steps % args.save_interval == 0 and total_steps < args.max_train_steps:
-                        save_checkpoint(agent, run_dir, episode, total_steps, updates,
-                                        recent_outcomes, checkpoint_records)
-            if training and total_steps == args.max_train_steps:
-                if buffer.size:
-                    agent.update(buffer)
-                    updates += 1
-                save_checkpoint(agent, run_dir, episode, total_steps, updates,
-                                recent_outcomes, checkpoint_records, final=True)
-                print("training complete: total_steps={} episodes={} updates={}".format(
-                    total_steps, episode, updates), flush=True)
+                    if checkpoint_due:
+                        record = save_checkpoint(agent, run_dir, episode, total_steps, updates,
+                                                 recent_outcomes, checkpoint_records, final=final_step)
+                        rates = evaluate(agent, env, args.eval_episodes, args.seed)
+                        if rates is None:
+                            return
+                        record.update(eval_episodes=args.eval_episodes,
+                                      **{"eval_" + name + "_rate": rate for name, rate in rates.items()})
+                        write_checkpoint_metrics(run_dir, checkpoint_records)
+                        writer.add_scalars("eval/outcome_rate", rates, total_steps)
+                        if not final_step and not rospy.is_shutdown():
+                            state, _ = env.reset(seed=args.seed + episode)
     finally:
         env.close()
 

@@ -183,7 +183,9 @@ class TurtleBot3Env:
         self.steps = 0
         obs, info = self._observe(scan, odom)
         self.previous_distance = info["astar_distance"]
-        info.update(reached=False, collision=False, timeout=False)
+        info.update(step=0, reached=False, collision=False, timeout=False)
+        if self.grid.visualize:
+            self.grid.viewer.update(info)
         return obs, info
 
     def step(self, action):
@@ -204,12 +206,15 @@ class TurtleBot3Env:
         reward, reached, collision, parts = navigation_reward(
             self.previous_distance, info["astar_distance"], info["distance"], info["min_scan"],
         )
-        self.previous_distance = info["astar_distance"]
         terminated = reached or collision
         truncated = self.steps >= self.timeout_steps and not terminated
-        info.update(parts, reached=reached, collision=collision, timeout=truncated)
+        info.update(parts, step=self.steps, previous_astar_distance=self.previous_distance,
+                    reward=reward, reached=reached, collision=collision, timeout=truncated)
+        self.previous_distance = info["astar_distance"]
         if terminated or truncated:
             self.stop()
+        if self.grid.visualize:
+            self.grid.viewer.update(info)
         return obs, reward, terminated, truncated, info
 
     def stop(self):
