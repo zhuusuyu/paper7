@@ -491,7 +491,7 @@ class AStarViewer:
 
 
 def navigation_reward(previous_distance, distance, goal_distance, min_scan,
-                      goal_radius=0.5, collision_distance=0.15):
+                      goal_radius=0.1, collision_distance=0.15):
     collision = min_scan < collision_distance
     reached = goal_distance < goal_radius and not collision
     parts = {
