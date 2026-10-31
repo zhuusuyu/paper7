@@ -376,7 +376,7 @@ def navigation_reward(previous_distance, distance, goal_distance, min_scan,
     reached = goal_distance < goal_radius and not collision
     parts = {
         "r_arrival": 100.0 if reached else 0.0,
-        "r_step": -0.1,
+        "r_step": -1,
         "r_dist": 5 * (previous_distance - distance),
         "r_collision": -100.0 if collision else 0.0,
     }

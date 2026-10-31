@@ -79,7 +79,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=Path("runs"))
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--seed", type=int, default=3)
-    parser.add_argument("--max-train-steps", type=int, default=100000, help="Total environment steps, including restored steps")
+    parser.add_argument("--max-train-steps", type=int, default=200000, help="Total environment steps, including restored steps")
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--save-interval", type=int, default=10000, help="Training steps between checkpoint saves and evaluations")
     parser.add_argument("--robot-model-name", default="turtlebot3_burger")
