@@ -1,8 +1,9 @@
 # PPO-Attention：空间注意力与超网络知识融合
 
-在 `ppo_attention/` 内独立实现，保持四个 Python 文件，不导入参考项目模块：
+在 `ppo_attention/` 内独立实现，训练代码保持四个 Python 文件，不导入参考项目模块：
 `main.py` 负责训练、评估、日志；`ppo_agent.py` 负责融合策略、PPO 更新与 checkpoint；
 `util.py` 包含注意力网络、模糊知识、超网络、buffer、地图和奖励；`turtlebot3_env.py` 负责 ROS。
+另有独立的 `eval.py`，用于在已启动的场景中评估固定路线，不创建地图或计算奖励。
 
 借鉴所附 STA-KGRL 的空间风险注意力、动作与模仿引导，以及
 [NeurIPS 2024 hhk-MARL 第 3.2 节](https://papers.nips.cc/paper_files/paper/2024/file/ba29e3f830d039c3f1fa0b4dfcf19c54-Paper-Conference.pdf)
@@ -52,6 +53,50 @@ python main.py --max-train-steps 13 --save-interval 5 --eval-episodes 2 \
 参数兼容性在加载边界检查一次。改变过网络宽度、速度上限、引导配置时，加载命令需传入相同值。
 恢复优化器时采用本次命令的学习率，从新回合继续；不恢复 Gazebo 中间状态或未更新的 rollout。
 修改源文件后需重启训练进程才能生效。
+
+## House 固定路线评估
+
+先在一个终端启动 House：
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /home/hnu/turtlebot3_ws/devel/setup.bash
+export TURTLEBOT3_MODEL=burger
+roslaunch turtlebot3_gazebo turtlebot3_house.launch
+```
+
+再在另一个终端评估：
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /home/hnu/turtlebot3_ws/devel/setup.bash
+cd /home/hnu/turtlebot3_ws/src/paper_7/ppo_attention
+/home/hnu/anaconda3/envs/turtlebot3_ws/bin/python eval.py --scene house \
+  --start -3 1 --yaw 180 --goal -6.5 -2.5
+```
+
+`--scene house` 连接现有 Gazebo 中名为 `turtlebot3` 的机器人，不负责启动或切换场景。
+`--yaw` 是直接设置的世界坐标朝向，单位为度；180 表示朝向世界坐标的负 x 方向。
+默认只评估一次，可用 `--episodes` 指定次数。默认 CUDA，CPU 需显式 `--device cpu`。
+
+脚本从 `runs/attention_paper/checkpoint_metrics.csv` 按评估成功率最高、
+并列时训练步数最多选完整策略；可用 `--model-dir` 指定其他模型目录。
+当前选中 `step_180000.pt`，原场景评估为 20/20 成功。
+网络结构、动作上限、动作时长及超时步数均读取 checkpoint 配置；此模型为 0.2 秒动作窗口、800 步超时。
+使用 checkpoint 固定训练步数下的确定性融合策略，所有策略参数冻结，不采样训练动作、不更新网络。
+
+观测仍为 364 维，目标距离固定除以 `5√2 m`，不按 House 尺寸重新归一化。
+实际目标距离严格 `<0.1 m` 且未碰撞才成功；完整雷达最小距离严格 `<0.15 m` 算碰撞，碰撞优先。
+沿用暂停/继续动作流程，普通动作间不额外停车；reset 和退出时停车并清理目标。
+不创建 GridMap、不运行 A*、不计算奖励，不生成 TensorBoard 日志或模型。
+
+终端打印所选模型、轨迹文件和每次评估的结果、步数、最终距离。
+每次启动只生成一个 `runs/eval_house_<UTC时间>.csv`，记录初始状态及逐步位姿、目标距离、
+雷达最小值、实际发布动作、融合权重、置信度和结果；CSV 中 yaw/heading 单位为弧度。
+Ctrl+C 会保留已写入轨迹，并执行停车、暂停和目标清理。
+
+隔离 House 的一次 CUDA 实测：该模型第 213 步碰撞，距目标 3.565269 m。
+原场景的 100% 成功率不代表 House 的迁移成功率。
 
 ## 观测、动作和环境
 
