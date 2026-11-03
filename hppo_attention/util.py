@@ -501,3 +501,135 @@ def navigation_reward(previous_distance, distance, goal_distance, min_scan,
         "r_collision": -100.0 if collision else 0.0,
     }
     return float(sum(parts.values())), reached, collision, parts
+
+
+class HighQNetwork(nn.Module):
+    """Four-frame dueling Q function over 225 polar candidates."""
+
+    def __init__(self, width=256):
+        super().__init__()
+        self.encoder = nn.Sequential(nn.Linear(1456, width), nn.Tanh(), nn.Linear(width, width), nn.Tanh())
+        self.value = nn.Linear(width, 1)
+        self.advantage = nn.Linear(width, 225)
+
+    def forward(self, states):
+        features = self.encoder(states)
+        advantage = self.advantage(features)
+        return self.value(features) + advantage - advantage.mean(-1, keepdim=True)
+
+
+class FrameStack:
+    def reset(self, state):
+        self.frames = np.tile(state, (4, 1)).astype(np.float32)
+        return self.snapshot()
+
+    def append(self, state):
+        self.frames[:-1] = self.frames[1:]
+        self.frames[-1] = state
+
+    def snapshot(self):
+        return self.frames.reshape(1456).copy()
+
+
+def goal_observation(ranges, position, yaw, velocity, goal, v_max, w_max):
+    """One observation definition shared by the 2D and ROS adapters."""
+    delta = np.asarray(goal) - position
+    distance = float(np.linalg.norm(delta))
+    heading = (math.atan2(delta[1], delta[0]) - yaw + math.pi) % (2 * math.pi) - math.pi
+    obs = np.concatenate((np.clip(ranges, 0, 3.5) / 3.5, [velocity[0] / v_max, velocity[1] / w_max,
+                           distance / (5 * math.sqrt(2)), heading / math.pi])).astype(np.float32)
+    return obs, distance, heading
+
+
+class SubgoalSpace:
+    def __init__(self, angle_min, angle_increment):
+        self.radii = np.repeat((np.arange(15) + .5) * 3.5 / 15, 15)
+        self.angles = np.tile(np.arange(15) * 2 * math.pi / 15, 15)
+        self.points = self.radii[:, None] * np.stack((np.cos(self.angles), np.sin(self.angles)), -1)
+        self.beams = angle_min + np.arange(360) * angle_increment
+        self.angle_increment = abs(angle_increment)
+
+    def candidates(self, state):
+        """Replace one bin by the exact visible final goal; never force its selection."""
+        points = self.points.copy()
+        radii = self.radii.copy()
+        distance, heading = float(state[362]) * 5 * math.sqrt(2), float(state[363]) * math.pi
+        exact = -1
+        if 0 < distance < 3.5:
+            goal = distance * np.array([math.cos(heading), math.sin(heading)])
+            exact = int(np.square(points - goal).sum(1).argmin())
+            points[exact], radii[exact] = goal, distance
+        # Rays originate 0.032 m behind base_link. Test the far intersection of
+        # each ray with the safety disk, rather than its enclosing cone.
+        scan_points = points + np.array([.032, 0.])
+        scan_radii = np.linalg.norm(scan_points, axis=1)
+        scan_angles = np.arctan2(scan_points[:, 1], scan_points[:, 0])
+        error = self.beams[None] - scan_angles[:, None]
+        projection = scan_radii[:, None] * np.cos(error)
+        radius = .15 + scan_radii * math.sin(self.angle_increment / 2)
+        discriminant = radius[:, None] ** 2 - (scan_radii[:, None] * np.sin(error)) ** 2
+        far = projection + np.sqrt(np.maximum(discriminant, 0.))
+        covered = (discriminant >= 0.) & (far > 0.)
+        clear = (~covered | (state[None, :360] * 3.5 > far)).all(1)
+        mask = clear & (radii > .5)
+        if exact >= 0:
+            mask[exact] = clear[exact]
+        return points, mask, exact
+
+    @staticmethod
+    def world_point(point, info):
+        c, s = math.cos(info['yaw']), math.sin(info['yaw'])
+        return np.array([info['x'], info['y']]) + np.array([[c, -s], [s, c]]) @ point
+
+
+class SubgoalProgress:
+    def __init__(self, distance, heading, reach_radius, v_max, w_max):
+        self.reach_radius = reach_radius
+        self.best_distance = self.distance_anchor = distance
+        self.best_heading = self.heading_anchor = abs(heading)
+        self.last_progress = 0.
+        self.limit = max(6., 3 + 2 * max(distance - reach_radius, 0) / v_max + 2 * abs(heading) / w_max)
+
+    def update(self, distance, heading, elapsed):
+        self.best_distance = min(self.best_distance, distance)
+        self.best_heading = min(self.best_heading, abs(heading))
+        if self.distance_anchor - self.best_distance >= .05 or self.heading_anchor - self.best_heading >= math.radians(15):
+            self.distance_anchor, self.heading_anchor = self.best_distance, self.best_heading
+            self.last_progress = elapsed
+        if distance < self.reach_radius:
+            return 'subgoal_reached'
+        if elapsed - self.last_progress >= 3 - 1e-9:
+            return 'stalled'
+        if elapsed >= self.limit - 1e-9:
+            return 'time_limit'
+        return 'running'
+
+
+class HighReplay:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.size = self.position = 0
+        self.data = dict(states=np.empty((capacity, 1456), np.float32),
+                         next_states=np.empty((capacity, 1456), np.float32),
+                         actions=np.empty(capacity, np.int64), rewards=np.empty(capacity, np.float32),
+                         next_masks=np.empty((capacity, 225), bool),
+                         terminated=np.empty(capacity, bool), truncated=np.empty(capacity, bool))
+
+    def add(self, state, action, reward, next_state, mask, terminated, truncated):
+        for key, value in zip(self.data, (state, next_state, action, reward, mask, terminated, truncated)):
+            self.data[key][self.position] = value
+        self.position = (self.position + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, count, device):
+        indices = np.random.choice(self.size, count, replace=False)
+        return {k: torch.as_tensor(v[indices], device=device) for k, v in self.data.items()}
+
+    def state_dict(self):
+        return dict(size=self.size, position=self.position,
+                    data={key: value[:self.size].copy() for key, value in self.data.items()})
+
+    def load_state_dict(self, saved):
+        self.size, self.position = saved['size'], saved['position']
+        for key, value in saved['data'].items():
+            self.data[key][:self.size] = value

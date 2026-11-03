@@ -123,3 +123,78 @@ class PPOAgent:
             for group in self.critic_optimizer.param_groups:
                 group["lr"] = self.config["critic_lr"]
         return {key: checkpoint[key] for key in ("episode", "total_steps", "updates", "recent_outcomes")}
+
+
+class HighLevelAgent:
+    """Train only the dueling Double DQN; retain the complete frozen low policy."""
+
+    def __init__(self, config, low_checkpoint):
+        import copy
+        from util import HighQNetwork, HighReplay
+
+        self.config = dict(config)
+        self.device = torch.device(config['device'])
+        if (low_checkpoint.get('algorithm') != 'PPO_ATTENTION' or low_checkpoint['version'] != 1
+                or low_checkpoint['observation_shape'] != (364,)):
+            raise ValueError('Low policy must be a complete PPO_ATTENTION v1 checkpoint')
+        self.low_checkpoint = low_checkpoint
+        self.low = PPOAgent(dict(low_checkpoint['config'], device=config['device']))
+        for name in ('actor', 'fuzzy', 'fusion', 'critic'):
+            module = getattr(self.low, name)
+            module.load_state_dict(low_checkpoint[name])
+            module.requires_grad_(False).eval()
+        self.online = HighQNetwork(config['net_width']).to(self.device)
+        self.target = copy.deepcopy(self.online).requires_grad_(False).eval()
+        self.optimizer = torch.optim.Adam(self.online.parameters(), lr=config['high_lr'])
+        self.replay = HighReplay(config['replay_capacity'])
+        self.updates = 0
+
+    def select_action(self, state, mask, total_steps, deterministic=False):
+        epsilon = 1 + (.05 - 1) * min(total_steps / self.config['epsilon_decay_steps'], 1)
+        if not deterministic and np.random.random() < epsilon:
+            return int(np.random.choice(np.flatnonzero(mask)))
+        with torch.no_grad():
+            states = torch.as_tensor(state, device=self.device).unsqueeze(0)
+            return int(self.online(states).masked_fill(~torch.as_tensor(mask, device=self.device), -torch.inf).argmax(-1).item())
+
+    def low_action(self, state):
+        return self.low.select_action(state, self.low_checkpoint['total_steps'], deterministic=True)[0]
+
+    def update(self):
+        batch = self.replay.sample(self.config['batch_size'], self.device)
+        with torch.no_grad():
+            targets = batch['rewards'].clone()
+            bootstrap = ~batch['terminated']
+            if bootstrap.any():
+                states = batch['next_states'][bootstrap]
+                actions = self.online(states).masked_fill(~batch['next_masks'][bootstrap], -torch.inf).argmax(-1, keepdim=True)
+                targets[bootstrap] += self.config['gamma'] * self.target(states).gather(1, actions).squeeze(1)
+        loss = F.smooth_l1_loss(self.online(batch['states']).gather(1, batch['actions'][:, None]).squeeze(1), targets)
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.online.parameters(), self.config['max_grad_norm'])
+        self.optimizer.step()
+        self.updates += 1
+        if self.updates % self.config['target_update'] == 0:
+            self.target.load_state_dict(self.online.state_dict())
+        return loss.item()
+
+    def save(self, path, counters):
+        torch.save(dict(algorithm='HPPO_ATTENTION', version=1, observation_shape=(1456,),
+                        config=self.config, low_checkpoint=self.low_checkpoint,
+                        online=self.online.state_dict(), target=self.target.state_dict(),
+                        optimizer=self.optimizer.state_dict(), replay=self.replay.state_dict(),
+                        updates=self.updates, counters=counters, numpy_rng=np.random.get_state(),
+                        torch_rng=torch.get_rng_state(),
+                        cuda_rng=torch.cuda.get_rng_state_all() if self.device.type == 'cuda' else []), path)
+
+    def restore(self, saved):
+        self.online.load_state_dict(saved['online'])
+        self.target.load_state_dict(saved['target'])
+        self.optimizer.load_state_dict(saved['optimizer'])
+        self.replay.load_state_dict(saved['replay'])
+        self.updates = saved['updates']
+        np.random.set_state(saved['numpy_rng'])
+        torch.set_rng_state(saved['torch_rng'].cpu())
+        if self.device.type == 'cuda' and saved['cuda_rng']:
+            torch.cuda.set_rng_state_all([state.cpu() for state in saved['cuda_rng']])

@@ -232,3 +232,129 @@ class TurtleBot3Env:
             finally:
                 self.scan_sub.unregister()
                 self.odom_sub.unregister()
+
+
+class HighGazeboEnv(TurtleBot3Env):
+    """Evaluation adapter: final-goal observations, fixed subgoals, no global map."""
+
+    def __init__(self, low_config, start, goal, yaw, timeout_steps, robot_model_name, sensor_timeout):
+        self.start_xy = np.asarray(start, dtype=np.float64)
+        self.goal_xy = np.asarray(goal, dtype=np.float64)
+        self.start_yaw = yaw
+        self.subgoal_model_name = 'hppo_subgoal'
+        super().__init__(None, low_config['v_max'], low_config['w_max'], low_config['action_duration'],
+                         timeout_steps, sensor_timeout, robot_model_name)
+        for key in ('scan_angle_min', 'scan_angle_increment'):
+            if getattr(self, key) != low_config[key]:
+                self.close()
+                raise ValueError('Live ' + key + ' differs from the frozen low policy')
+        if self.subgoal_model_name in self.world_properties().model_names:
+            self._delete_goal(self.subgoal_model_name)
+
+    def _observe(self, scan, odom):
+        from util import goal_observation
+        self.ranges = np.clip(np.nan_to_num(np.asarray(scan.ranges, np.float32),
+                                           nan=0., posinf=3.5, neginf=0.), 0., 3.5)
+        position = odom.pose.pose.position
+        q = odom.pose.pose.orientation
+        self.position = np.array([position.x, position.y])
+        self.yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+        self.velocity = np.array([odom.twist.twist.linear.x, odom.twist.twist.angular.z])
+        state, distance, heading = goal_observation(self.ranges, self.position, self.yaw, self.velocity,
+                                                  self.goal_xy, self.v_max, self.w_max)
+        collision = self.ranges.min() < .15
+        reached = distance < .1 and not collision
+        timeout = self.steps >= self.timeout_steps and not (collision or reached)
+        info = dict(x=float(position.x), y=float(position.y), yaw=self.yaw, distance=distance, heading=heading,
+                    min_scan=float(self.ranges.min()), step=self.steps, reached=reached, collision=collision,
+                    timeout=timeout, sim_time=rospy.Time.now().to_sec(), sim_duration=self.last_duration,
+                    outcome='collision' if collision else 'success' if reached else 'timeout' if timeout else 'running')
+        return state, info
+
+    def reset(self, kind, seed):
+        self.kind = kind
+        self.stop()
+        self.reset_world()
+        self._set_pose(self.robot_model_name, self.start_xy, self.start_yaw)
+        names = self.world_properties().model_names
+        for name in (self.goal_model_name, self.subgoal_model_name):
+            if name in names:
+                self._delete_goal(name)
+        time.sleep(.2)
+        pose = Pose()
+        pose.position.x, pose.position.y = map(float, self.goal_xy)
+        pose.orientation.w = 1.
+        response = self.spawn_model(self.goal_model_name, self._goal_sdf, '', pose, 'world')
+        if not response.success:
+            raise RuntimeError('Cannot spawn goal: ' + response.status_message)
+        with self._condition:
+            counts = self._scan_count, self._odom_count
+        started = rospy.Time.now().to_sec()
+        try:
+            self.unpause_sim()
+            rospy.sleep(.15)
+            scan, odom = self._wait_messages(counts, started)
+        finally:
+            self.pause_sim()
+        self.steps = 0
+        self.last_duration = self.path_length = self.initial_distance = 0.
+        self.subgoal_xy = self.goal_xy.copy()
+        self.state, self.info = self._observe(scan, odom)
+        return self.state.copy(), dict(self.info)
+
+    def low_state(self):
+        from util import goal_observation
+        return goal_observation(self.ranges, self.position, self.yaw, self.velocity,
+                                self.subgoal_xy, self.v_max, self.w_max)[0]
+
+    def set_subgoal(self, point):
+        self.subgoal_xy = np.asarray(point).copy()
+        if self.subgoal_model_name in self.world_properties().model_names:
+            self._delete_goal(self.subgoal_model_name)
+        pose = Pose()
+        pose.position.x, pose.position.y = map(float, point)
+        pose.orientation.w = 1.
+        sdf = self._goal_sdf.replace(self.goal_model_name, self.subgoal_model_name).replace('0 1 0 1', '.7 .1 .9 1')
+        response = self.spawn_model(self.subgoal_model_name, sdf, '', pose, 'world')
+        if not response.success:
+            raise RuntimeError('Cannot spawn subgoal: ' + response.status_message)
+
+    def step(self, action):
+        with self._condition:
+            counts = self._scan_count, self._odom_count
+        command = Twist()
+        command.linear.x, command.angular.z = map(float, action)
+        old = self.position.copy()
+        self.cmd_pub.publish(command)
+        started = rospy.Time.now().to_sec()
+        try:
+            self.unpause_sim()
+            rospy.sleep(self.action_duration)
+        finally:
+            self.pause_sim()
+        self.last_duration = rospy.Time.now().to_sec() - started
+        scan, odom = self._wait_messages(counts, started)
+        self.steps += 1
+        self.state, self.info = self._observe(scan, odom)
+        self.path_length += float(np.linalg.norm(self.position - old))
+        terminated = self.info['reached'] or self.info['collision']
+        truncated = self.info['timeout']
+        if terminated or truncated:
+            self.stop()
+        return self.state.copy(), terminated, truncated, dict(self.info)
+
+    def astar_distance(self):
+        return 0.  # Deployment does not construct a map or compute reward distances.
+
+    def refresh(self):
+        pass  # Gazebo draws the robot and the two goal models.
+
+    def close(self):
+        with self._close_lock:
+            if self._closed:
+                return
+            try:
+                if self.subgoal_model_name in self.world_properties().model_names:
+                    self._delete_goal(self.subgoal_model_name)
+            finally:
+                super().close()
