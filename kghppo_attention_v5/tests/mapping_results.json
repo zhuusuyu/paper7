@@ -1,0 +1,142 @@
+[
+  {
+    "kind": "corridor",
+    "width": 0.3,
+    "offset": 0.0,
+    "sensor_map_connected": false
+  },
+  {
+    "kind": "corridor",
+    "width": 0.3,
+    "offset": 0.1,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "corridor",
+    "width": 0.4,
+    "offset": 0.0,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "corridor",
+    "width": 0.4,
+    "offset": 0.1,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "corridor",
+    "width": 0.6,
+    "offset": 0.0,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "corridor",
+    "width": 0.6,
+    "offset": 0.1,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "corridor",
+    "width": 0.8,
+    "offset": 0.0,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "corridor",
+    "width": 0.8,
+    "offset": 0.1,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "corridor",
+    "width": 1.2,
+    "offset": 0.0,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "corridor",
+    "width": 1.2,
+    "offset": 0.1,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "door",
+    "width": 0.3,
+    "offset": 0.0,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "door",
+    "width": 0.3,
+    "offset": 0.1,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "door",
+    "width": 0.4,
+    "offset": 0.0,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "door",
+    "width": 0.4,
+    "offset": 0.1,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "door",
+    "width": 0.6,
+    "offset": 0.0,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "door",
+    "width": 0.6,
+    "offset": 0.1,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "door",
+    "width": 0.8,
+    "offset": 0.0,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "door",
+    "width": 0.8,
+    "offset": 0.1,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "door",
+    "width": 1.2,
+    "offset": 0.0,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "door",
+    "width": 1.2,
+    "offset": 0.1,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "narrow_validation",
+    "seed": 5000004,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "narrow_validation",
+    "seed": 5000009,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "narrow_validation",
+    "seed": 5000014,
+    "sensor_map_connected": true
+  },
+  {
+    "kind": "narrow_validation",
+    "seed": 5000019,
+    "sensor_map_connected": true
+  }
+]

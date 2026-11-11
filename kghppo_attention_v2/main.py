@@ -222,7 +222,7 @@ def main():
     parser.add_argument('--seed', type=int, default=3)
     parser.add_argument('--max-train-steps', type=int, default=200000)
     parser.add_argument('--save-interval', type=int, default=10000)
-    parser.add_argument('--eval-episodes', type=int, default=100)
+    parser.add_argument('--eval-episodes', type=int, default=20)
     parser.add_argument('--timeout-steps', type=int, default=800)
     parser.add_argument('--net-width', type=int, default=256)
     parser.add_argument('--high-lr', type=float, default=3e-4)
